@@ -57,6 +57,20 @@ uses normal certificate verification. No proxy environment, redirects or
 connection retries are used. All probe clients receive the same hardened
 transport. Bounded streams preserve actual first-byte timings.
 
+For hosts using a local proxy's fake-IP DNS mode, fallback is narrowly limited
+to system DNS replies containing **only** addresses in `198.18.0.0/15`.
+The worker never connects to those fake IPs. It instead makes one TLS-verified
+DNS-over-HTTPS A query to the fixed numeric endpoint
+`https://1.1.1.1/dns-query`, with no environment proxy, redirects or retries.
+Only the target hostname is sent, never its URL path or API credentials.
+The lookup has a five-second total limit, a 16 KiB response cap and a 64-answer
+cap; all returned connection addresses must pass the same public-IP policy.
+Private/mixed system replies do not trigger fallback. Malformed, private,
+oversized or timed-out DoH replies fail closed. Normal public system DNS
+continues unchanged; original target TLS hostname and Host headers remain
+unchanged. This compatibility path needs public IPv4 reachability and reveals
+the requested hostname to the fixed public DNS resolver.
+
 ## Internal API
 
 `GET /healthz` is unauthenticated and returns only `{ "status": "ok" }`.

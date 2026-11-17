@@ -2,7 +2,9 @@
 
 Only the TCP backend substitutes the validated numeric address. The request
 origin, Host header and httpcore TLS server_hostname remain the original host.
-No address fallback, connection retry, proxy, redirect or Unix socket is used.
+No connection retry, proxy, redirect or Unix socket is used. A system resolver
+returning only benchmark-range fake IPs can use the fixed public DoH resolver;
+neither fake nor private addresses are ever dialed.
 """
 import asyncio
 import ipaddress
@@ -18,6 +20,8 @@ SPECIAL_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
     '192.0.0.0/24', '192.88.99.0/24',
     '64:ff9b::/96', '64:ff9b:1::/48', '2001::/23', '2002::/16',
 ))
+FAKE_IP_NETWORK = ipaddress.ip_network('198.18.0.0/15')
+DOH_TIMEOUT = 5
 
 
 class UnsafeTarget(Exception):
@@ -63,7 +67,70 @@ def validate_url(value):
 
 async def resolve_public(host, port):
     rows = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    return list(dict.fromkeys(row[4][0] for row in rows))
+    addresses = list(dict.fromkeys(row[4][0] for row in rows))
+    if not addresses:
+        raise UnsafeTarget()
+    # Narrow fake-IP mode recovery only. Mixed answers, local names and other
+    # non-public ranges retain the ordinary fail-closed policy.
+    try:
+        fake_only = all(ipaddress.ip_address(address) in FAKE_IP_NETWORK for address in addresses)
+    except ValueError:
+        raise UnsafeTarget() from None
+    if fake_only:
+        addresses = await resolve_doh(host)
+        if not addresses:
+            raise UnsafeTarget()
+    return [public_ip(address) for address in addresses]
+
+
+async def resolve_doh(host, *, transport=None):
+    """One bounded A lookup to a fixed numeric, certificate-verified resolver.
+
+    Only the target hostname leaves this function; no target authentication,
+    path or request body is forwarded. This transport deliberately does not use
+    PublicBackend, preventing recursive fake-IP fallback for the resolver.
+    """
+    async def query():
+        outbound = transport if transport is not None else httpx.AsyncHTTPTransport(
+            retries=0, trust_env=False, verify=True,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0))
+        async with httpx.AsyncClient(transport=outbound, trust_env=False,
+                follow_redirects=False, timeout=DOH_TIMEOUT,
+                headers={'accept': 'application/dns-json', 'accept-encoding': 'identity'}) as client:
+            async with client.stream('GET', 'https://1.1.1.1/dns-query',
+                    params={'name': host, 'type': 'A'}) as response:
+                if response.status_code != 200 or response.headers.get('content-encoding', 'identity') != 'identity':
+                    raise UnsafeTarget()
+                raw = bytearray()
+                async for chunk in response.aiter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > 16384:
+                        raise UnsafeTarget()
+                payload = json.loads(raw)
+                if not isinstance(payload, dict) or type(payload.get('Status')) is not int or payload['Status'] != 0 or payload.get('TC'):
+                    raise UnsafeTarget()
+                answers = payload.get('Answer')
+                if not isinstance(answers, list) or not 1 <= len(answers) <= 64:
+                    raise UnsafeTarget()
+                addresses = []
+                for answer in answers:
+                    if not isinstance(answer, dict) or type(answer.get('type')) is not int or not isinstance(answer.get('data'), str):
+                        raise UnsafeTarget()
+                    if answer['type'] == 5:  # CNAME; only returned A records are dialed
+                        continue
+                    if answer['type'] != 1:
+                        raise UnsafeTarget()
+                    address = public_ip(answer['data'])
+                    if ipaddress.ip_address(address).version != 4:
+                        raise UnsafeTarget()
+                    addresses.append(address)
+                if not addresses:
+                    raise UnsafeTarget()
+                return list(dict.fromkeys(addresses))
+    try:
+        return await asyncio.wait_for(query(), timeout=DOH_TIMEOUT)
+    except Exception:
+        raise UnsafeTarget() from None
 
 
 class PublicBackend(AnyIOBackend):

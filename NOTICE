@@ -15,6 +15,8 @@ long-context opt-in and failure-stop; packaging, deployment docs and tests.
 Additional TokenJoy modification (2026-11-17): authenticated transient catalog
 lookup with the same secure outbound transport, fixed model-list request,
 bounded filtered Claude/OpenAI/Gemini IDs and no inference probes or storage.
+Fake-IP DNS compatibility: benchmark-only system answers may use one bounded
+fixed public DoH lookup; connection-time public-IP and TLS validation remain.
 
 Corresponding modified source: https://github.com/Alaiked/tokenjoy-veridrop
 Operators must provide users the actual corresponding source of their running
