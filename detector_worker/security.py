@@ -1,0 +1,180 @@
+"""Connection-time DNS validation; httpcore retains the original TLS SNI.
+
+Only the TCP backend substitutes the validated numeric address. The request
+origin, Host header and httpcore TLS server_hostname remain the original host.
+No address fallback, connection retry, proxy, redirect or Unix socket is used.
+"""
+import asyncio
+import ipaddress
+import json
+import socket
+from urllib.parse import urlsplit, urlunsplit
+
+import httpcore
+import httpx
+from httpcore._backends.anyio import AnyIOBackend
+
+SPECIAL_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
+    '192.0.0.0/24', '192.88.99.0/24',
+    '64:ff9b::/96', '64:ff9b:1::/48', '2001::/23', '2002::/16',
+))
+
+
+class UnsafeTarget(Exception):
+    def __init__(self):
+        super().__init__('outbound_policy')
+
+
+def public_ip(value):
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        raise UnsafeTarget() from None
+    if (not ip.is_global or ip.is_multicast or ip.is_reserved or
+            any(ip.version == net.version and ip in net for net in SPECIAL_NETWORKS) or
+            getattr(ip, 'ipv4_mapped', None) is not None or
+            (ip.version == 6 and (ip.sixtofour is not None or ip.teredo is not None))):
+        raise UnsafeTarget()
+    return str(ip)
+
+
+def validate_url(value):
+    try:
+        if not isinstance(value, str) or len(value) > 2048 or any(ord(c) < 33 for c in value) or '\\' in value:
+            raise UnsafeTarget()
+        p = urlsplit(value)
+        if (p.scheme != 'https' or not p.hostname or p.username is not None or
+                p.password is not None or '?' in value or '#' in value or
+                p.port not in (None, 443) or '%' in p.netloc):
+            raise UnsafeTarget()
+        host = p.hostname.encode('idna').decode('ascii').lower()
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            if '.' not in host or host.endswith('.') or any(not (c.isalnum() or c in '.-') for c in host):
+                raise UnsafeTarget()
+        else:
+            public_ip(host)
+        authority = f'[{host}]' if ':' in host else host
+        return urlunsplit(('https', authority, p.path.rstrip('/'), '', ''))
+    except (ValueError, UnicodeError):
+        raise UnsafeTarget() from None
+
+
+async def resolve_public(host, port):
+    rows = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return list(dict.fromkeys(row[4][0] for row in rows))
+
+
+class PublicBackend(AnyIOBackend):
+    def __init__(self, resolver=resolve_public, delegate=None):
+        self.resolver = resolver
+        self.delegate = delegate or AnyIOBackend()
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        if port != 443 or local_address is not None:
+            raise UnsafeTarget()
+        addresses = await asyncio.wait_for(self.resolver(host, port), timeout=min(timeout or 10, 10))
+        if not addresses:
+            raise UnsafeTarget()
+        pinned = [public_ip(a) for a in addresses]
+        return await self.delegate.connect_tcp(pinned[0], port, timeout=timeout,
+            local_address=None, socket_options=socket_options)
+
+    async def connect_unix_socket(self, *args, **kwargs):
+        raise UnsafeTarget()
+
+
+class SafeTransport(httpx.AsyncBaseTransport):
+    def __init__(self, base_url, *, inner=None, max_response=2_000_000,
+                 max_requests=48, long_context=False):
+        self.origin = httpx.URL(validate_url(base_url))
+        self.max_response = max_response
+        self.max_requests = max_requests
+        self.long_context = long_context
+        self.requests = 0
+        self.output_tokens = 0
+        self.input_bytes = 0
+        self.failed = False
+        if inner is None:
+            inner = httpx.AsyncHTTPTransport(retries=0, trust_env=False)
+            # Pinned httpx/httpcore versions: this is the one audited integration seam.
+            inner._pool = httpcore.AsyncConnectionPool(
+                network_backend=PublicBackend(), retries=0, max_connections=2,
+                max_keepalive_connections=0, http1=True, http2=False)
+        self.inner = inner
+
+    async def handle_async_request(self, request):
+        response = None
+        try:
+            validated = httpx.URL(validate_url(str(request.url)))
+            if (validated.host, validated.port) != (self.origin.host, self.origin.port):
+                raise UnsafeTarget()
+            if request.headers.get('host') != request.url.netloc.decode():
+                raise UnsafeTarget()
+            self.requests += 1
+            if self.failed or self.requests > self.max_requests:
+                raise UnsafeTarget()
+            raw = await request.aread()
+            self.input_bytes += len(raw)
+            if len(raw) > (1_500_000 if self.long_context else 150_000) or self.input_bytes > (4_000_000 if self.long_context else 1_000_000):
+                raise UnsafeTarget()
+            if raw:
+                body = json.loads(raw)
+                tokens = body.get('max_tokens', body.get('max_completion_tokens', 0))
+                if not isinstance(tokens, int) or tokens < 0 or tokens > 16384:
+                    raise UnsafeTarget()
+                self.output_tokens += tokens
+                if self.output_tokens > 65536:
+                    raise UnsafeTarget()
+            request.headers['accept-encoding'] = 'identity'
+            # Upstream long-context request overrides cannot lift the per-request cap.
+            request.extensions['timeout'] = dict(connect=10, read=30, write=30, pool=10)
+            response = await self.inner.handle_async_request(request)
+            if 300 <= response.status_code < 400:
+                raise UnsafeTarget()
+            if response.status_code in (401, 402, 403, 408, 429) or response.status_code >= 500:
+                self.failed = True
+            if response.headers.get('content-encoding', 'identity') != 'identity':
+                raise UnsafeTarget()
+            result = httpx.Response(response.status_code, headers=response.headers,
+                                    stream=BoundedStream(response, self), extensions=response.extensions)
+            response = None  # bounded stream now owns closing the response
+            return result
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            if response is not None:
+                await response.aclose()
+
+    async def aclose(self):
+        await self.inner.aclose()
+
+
+class BoundedStream(httpx.AsyncByteStream):
+    def __init__(self, response, owner):
+        self.response, self.owner = response, owner
+
+    async def __aiter__(self):
+        size = 0
+        try:
+            # Mock/custom transports may return an already buffered response.
+            if self.response.is_stream_consumed:
+                if len(self.response.content) > self.owner.max_response:
+                    raise UnsafeTarget()
+                yield self.response.content
+                return
+            async for chunk in self.response.aiter_raw():
+                size += len(chunk)
+                if size > self.owner.max_response:
+                    raise UnsafeTarget()
+                yield chunk
+        except BaseException:
+            self.owner.failed = True
+            raise
+        finally:
+            await self.response.aclose()
+
+    async def aclose(self):
+        await self.response.aclose()

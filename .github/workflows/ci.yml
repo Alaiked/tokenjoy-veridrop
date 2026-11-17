@@ -1,0 +1,32 @@
+name: Worker checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: python3 -m venv .venv
+      - run: .venv/bin/pip install -r requirements-dev.txt
+      - run: .venv/bin/python -m pytest tests -q
+      - run: docker build -t detector-check .
+      - name: Hardened container startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          task_container=$(docker run -d --read-only --network none --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --tmpfs /tmp:size=64m --tmpfs /data:size=16m,uid=10001,gid=10001,mode=0700 -e DETECTOR_REPORT_DIR=/data -e DETECTOR_SERVICE_TOKEN=ci-test-only-never-production detector-check)
+          trap 'docker rm -f "$task_container" >/dev/null' EXIT
+          for attempt in $(seq 1 20); do
+            if docker exec "$task_container" python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1

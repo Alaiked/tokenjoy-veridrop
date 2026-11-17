@@ -1,0 +1,18 @@
+TokenJoy Veridrop Worker
+Copyright 2026 TokenJoy contributors. AGPL-3.0-or-later.
+
+Includes Veridrop / relay-detector source by canarybyte and its contributors.
+Upstream: https://github.com/canarybyte/veridrop
+Fixed revision: e87ed92ae37250f87a6503b321c0bc7109618008
+Upstream license: GNU Affero General Public License version 3 or later.
+Full license text is preserved in LICENSE.
+
+TokenJoy modifications (2026-11-17): private authenticated bounded job API;
+connection-time public-IP DNS pinning and TLS origin preservation; bounded
+streaming, request/token limits, disabled HTTP/environment reference retries
+and caches; strict report field/metrics allowlists; truthful signature label;
+long-context opt-in and failure-stop; packaging, deployment docs and tests.
+
+Corresponding modified source: https://github.com/Alaiked/tokenjoy-veridrop
+Operators must provide users the actual corresponding source of their running
+version, including any further changes, as required by AGPL section 13.
