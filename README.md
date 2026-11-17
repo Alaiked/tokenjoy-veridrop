@@ -70,6 +70,26 @@ All remaining endpoints require `X-Detector-Token`:
 - `POST /jobs/{id}/ack`: website calls only after its database durably stores
   the terminal record; removes its durable outbox entry. Safe to repeat while
   the in-memory terminal job remains available.
+- `POST /models`: transient catalog lookup, body `{base_url,api_key}`, result
+  `{models:[{id,family}]}`. Families are `anthropic`, `openai`, `gemini`. Only
+  safe exact model IDs of at most 128 characters are returned; duplicates,
+  unsupported families and IDs echoing the key are discarded. GPT/ChatGPT,
+  Codex and o1/o3/o4 IDs count as OpenAI; Claude and Gemini IDs retain their
+  respective families, including supported vendor path prefixes. Empty
+  supported catalogs return `models:[]`, without inventing model choices.
+
+Catalog lookup makes exactly one authenticated GET to `<base>/v1/models`, or
+`<base>/models` when the base ends in `/v1` or `/v1beta/openai`. It sends both
+Bearer and `x-api-key` credentials, plus the Anthropic version header, only to
+that same validated HTTPS origin. It uses the same DNS-pinned, no-redirect,
+no-proxy transport as probes. It does not call model inference endpoints or
+reserve a job; keys and catalogs remain transient. Four concurrent lookups,
+12 seconds total, 1 MB response, 2,048 upstream rows and 512 filtered results
+are the fixed bounds. There is no endpoint fallback or retry. Errors expose
+only `detail`: HTTP 422 `invalid_request`, HTTP 413 `request_too_large`, HTTP
+429 `model_catalog_busy`, HTTP 502 `model_catalog_unavailable`, or HTTP 504
+`model_catalog_timeout`; authentication uses the usual HTTP 401 `unauthorized`.
+Remote error bodies and exception text are never forwarded.
 
 Job shape: `{id,protocol,base_url,model,long_context,state,created_at,
 finished_at?,report?,error_code?}`. Dates are ISO UTC. Reports contain

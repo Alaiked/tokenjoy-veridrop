@@ -66,15 +66,40 @@ async def test_cancel_terminates_inflight_and_drops_secret():
         assert not app.state.jobs.secrets
 
 
-async def test_queue_bound_and_generic_timeout():
+async def test_queue_bound_rejects_new_job_while_engine_is_held():
+    entered = asyncio.Event()
+    release = asyncio.Event()
     async def engine(spec, key):
-        await asyncio.sleep(100)
+        entered.set()
+        await release.wait()
+        return {'score': 100, 'verdict': 'passed', 'engine_version': 'fixture', 'checks': []}
     app = create_app(service_token='test-service-token', engine=engine,
-                     concurrency=1, capacity=1, job_timeout=.02)
+                     concurrency=1, capacity=1)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://worker') as c:
         await c.post('/jobs', json=PAYLOAD, headers=HEADERS)
-        r = await c.post('/jobs', json=dict(PAYLOAD, id='other'), headers=HEADERS)
-        assert r.status_code == 429
+        await asyncio.wait_for(entered.wait(), 2)
+        try:
+            r = await c.post('/jobs', json=dict(PAYLOAD, id='other'), headers=HEADERS)
+            assert r.status_code == 429
+            assert app.state.jobs.records['test-job-1']['state'] == 'running'
+            assert 'other' not in app.state.jobs.records
+        finally:
+            release.set()
+            await asyncio.wait_for(poll(c), 2)
+        assert not app.state.jobs.secrets
+
+
+async def test_job_timeout_cancels_engine_and_returns_generic_error():
+    cancelled = asyncio.Event()
+    async def engine(spec, key):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    app = create_app(service_token='test-service-token', engine=engine, job_timeout=.02)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://worker') as c:
+        assert (await c.post('/jobs', json=PAYLOAD, headers=HEADERS)).status_code == 202
+        await asyncio.wait_for(cancelled.wait(), 2)
         job = await poll(c)
         assert job['state'] == 'error' and job['error_code'] == 'timeout'
         assert not app.state.jobs.secrets

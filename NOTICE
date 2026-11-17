@@ -12,6 +12,9 @@ connection-time public-IP DNS pinning and TLS origin preservation; bounded
 streaming, request/token limits, disabled HTTP/environment reference retries
 and caches; strict report field/metrics allowlists; truthful signature label;
 long-context opt-in and failure-stop; packaging, deployment docs and tests.
+Additional TokenJoy modification (2026-11-17): authenticated transient catalog
+lookup with the same secure outbound transport, fixed model-list request,
+bounded filtered Claude/OpenAI/Gemini IDs and no inference probes or storage.
 
 Corresponding modified source: https://github.com/Alaiked/tokenjoy-veridrop
 Operators must provide users the actual corresponding source of their running

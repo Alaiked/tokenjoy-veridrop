@@ -32,6 +32,12 @@ class Submission(BaseModel):
     long_context: bool = False
 
 
+class CatalogSubmission(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    base_url: str = Field(max_length=2048)
+    api_key: SecretStr
+
+
 class Jobs:
     def __init__(self, engine, concurrency, capacity, timeout, retention, max_records, report_dir):
         self.engine, self.capacity, self.timeout = engine, capacity, timeout
@@ -118,7 +124,8 @@ class Jobs:
 
 
 def create_app(*, service_token=None, engine=None, concurrency=2, capacity=12,
-               job_timeout=240, retention=86400, max_records=2048, report_dir=None):
+               job_timeout=240, retention=86400, max_records=2048, report_dir=None,
+               catalog_transport_factory=None, catalog_concurrency=4, catalog_timeout=12):
     token = service_token if service_token is not None else os.environ.get('DETECTOR_SERVICE_TOKEN', '')
     if len(token) < 16:
         raise RuntimeError('DETECTOR_SERVICE_TOKEN must contain at least 16 characters')
@@ -127,6 +134,9 @@ def create_app(*, service_token=None, engine=None, concurrency=2, capacity=12,
         engine = run_detection
     jobs = Jobs(engine, concurrency, capacity, job_timeout, retention, max_records,
                 report_dir if report_dir is not None else os.environ.get('DETECTOR_REPORT_DIR'))
+    from .discovery import CatalogError, ModelCatalog
+    catalog = ModelCatalog(transport_factory=catalog_transport_factory,
+                           concurrency=catalog_concurrency, timeout=catalog_timeout)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -200,6 +210,22 @@ def create_app(*, service_token=None, engine=None, concurrency=2, capacity=12,
         jobs.secrets[data.id] = key
         jobs.tasks[data.id] = asyncio.create_task(jobs.run(data.id, spec))
         return jobs.records[data.id]
+
+    @app.post('/models')
+    async def discover_models(request: Request):
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > 16384:
+                raise HTTPException(413, 'request_too_large')
+        try:
+            data = CatalogSubmission.model_validate_json(raw)
+        except ValidationError:
+            raise HTTPException(422, 'invalid_request') from None
+        try:
+            return {'models': await catalog.discover(data.base_url, data.api_key.get_secret_value())}
+        except CatalogError as exc:
+            raise HTTPException(exc.status, exc.code) from None
 
     @app.get('/jobs/{ident}')
     async def get_job(ident: str):
