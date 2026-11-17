@@ -92,14 +92,24 @@ All remaining endpoints require `X-Detector-Token`:
   respective families, including supported vendor path prefixes. Empty
   supported catalogs return `models:[]`, without inventing model choices.
 
-Catalog lookup makes exactly one authenticated GET to `<base>/v1/models`, or
+Catalog lookup starts with a Bearer-only GET to `<base>/v1/models`, or
 `<base>/models` when the base ends in `/v1` or `/v1beta/openai`. It sends both
-Bearer and `x-api-key` credentials, plus the Anthropic version header, only to
-that same validated HTTPS origin. It uses the same DNS-pinned, no-redirect,
-no-proxy transport as probes. It does not call model inference endpoints or
-reserve a job; keys and catalogs remain transient. Four concurrent lookups,
-12 seconds total, 1 MB response, 2,048 upstream rows and 512 filtered results
-are the fixed bounds. There is no endpoint fallback or retry. Errors expose
+the `x-api-key` and Anthropic version headers only if the first request returns
+401/403, replacing Bearer authentication for one native-format fallback to the
+same endpoint. This avoids selecting a gateway's native paginated format when
+the complete OpenAI-compatible list is available. Successful native-shaped
+responses keep their current authentication and follow `has_more`/`last_id`
+cursor pages; they never return just the first page. Only the fixed catalog
+GET path can use the fixed `limit=1000` and validated `after_id` parameters.
+User-supplied base URL queries and probe request queries remain forbidden.
+All calls use the same DNS-pinned, no-redirect, no-proxy transport. No model
+inference endpoints or jobs are invoked; keys and catalogs remain transient.
+Four concurrent lookups, 12 seconds total, eight catalog GETs including auth
+fallback, 1 MB cumulative responses, 2,048 cumulative rows and 512 filtered
+results are fixed bounds. Invalid or repeated cursors, malformed pagination
+and limits reached before completion fail closed instead of returning partial
+results. There is no fallback to other origins or retry of transport, quota or
+server errors. Errors expose
 only `detail`: HTTP 422 `invalid_request`, HTTP 413 `request_too_large`, HTTP
 429 `model_catalog_busy`, HTTP 502 `model_catalog_unavailable`, or HTTP 504
 `model_catalog_timeout`; authentication uses the usual HTTP 401 `unauthorized`.

@@ -9,6 +9,7 @@ neither fake nor private addresses are ever dialed.
 import asyncio
 import ipaddress
 import json
+import re
 import socket
 from urllib.parse import urlsplit, urlunsplit
 
@@ -154,11 +155,12 @@ class PublicBackend(AnyIOBackend):
 
 class SafeTransport(httpx.AsyncBaseTransport):
     def __init__(self, base_url, *, inner=None, max_response=2_000_000,
-                 max_requests=48, long_context=False):
+                 max_requests=48, long_context=False, catalog_path=None):
         self.origin = httpx.URL(validate_url(base_url))
         self.max_response = max_response
         self.max_requests = max_requests
         self.long_context = long_context
+        self.catalog_path = catalog_path
         self.requests = 0
         self.output_tokens = 0
         self.input_bytes = 0
@@ -174,7 +176,18 @@ class SafeTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request):
         response = None
         try:
-            validated = httpx.URL(validate_url(str(request.url)))
+            if self.catalog_path is not None and (request.method != 'GET' or request.url.path != self.catalog_path):
+                raise UnsafeTarget()
+            if request.url.query and self.catalog_path is not None:
+                pairs = request.url.params.multi_items()
+                params = dict(pairs)
+                if (len(pairs) != len(params) or set(params) not in ({'limit'}, {'limit', 'after_id'}) or
+                        params.get('limit') != '1000' or
+                        ('after_id' in params and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}', params['after_id']))):
+                    raise UnsafeTarget()
+                validated = httpx.URL(validate_url(str(request.url.copy_with(query=None))))
+            else:
+                validated = httpx.URL(validate_url(str(request.url)))
             if (validated.host, validated.port) != (self.origin.host, self.origin.port):
                 raise UnsafeTarget()
             if request.headers.get('host') != request.url.netloc.decode():
@@ -183,6 +196,8 @@ class SafeTransport(httpx.AsyncBaseTransport):
             if self.failed or self.requests > self.max_requests:
                 raise UnsafeTarget()
             raw = await request.aread()
+            if self.catalog_path is not None and raw:
+                raise UnsafeTarget()
             self.input_bytes += len(raw)
             if len(raw) > (1_500_000 if self.long_context else 150_000) or self.input_bytes > (4_000_000 if self.long_context else 1_000_000):
                 raise UnsafeTarget()
@@ -200,7 +215,8 @@ class SafeTransport(httpx.AsyncBaseTransport):
             response = await self.inner.handle_async_request(request)
             if 300 <= response.status_code < 400:
                 raise UnsafeTarget()
-            if response.status_code in (401, 402, 403, 408, 429) or response.status_code >= 500:
+            allowed_catalog_auth = self.catalog_path is not None and response.status_code in (401, 403)
+            if not allowed_catalog_auth and (response.status_code in (401, 402, 403, 408, 429) or response.status_code >= 500):
                 self.failed = True
             if response.headers.get('content-encoding', 'identity') != 'identity':
                 raise UnsafeTarget()

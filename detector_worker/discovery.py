@@ -67,28 +67,57 @@ class ModelCatalog:
 
     async def _fetch(self, target, key):
         suffix = '/models' if target.endswith(('/v1', '/v1beta/openai')) else '/v1/models'
-        transport = self.transport_factory(target, max_requests=1, max_response=1_000_000)
+        endpoint = target + suffix
+        transport = self.transport_factory(target, max_requests=8, max_response=1_000_000,
+                                           catalog_path=httpx.URL(endpoint).path)
         async with httpx.AsyncClient(transport=transport, trust_env=False,
                 follow_redirects=False, timeout=self.timeout,
-                headers={'authorization': 'Bearer ' + key, 'x-api-key': key,
-                         'anthropic-version': '2023-06-01', 'accept': 'application/json'}) as client:
-            response = await client.get(target + suffix)
-            if response.status_code != 200:
-                raise CatalogError()
-            payload = response.json()
-            rows = payload.get('data') if isinstance(payload, dict) else None
-            if not isinstance(rows, list) or len(rows) > 2048 or any(not isinstance(row, dict) for row in rows):
-                raise CatalogError()
+                headers={'accept': 'application/json'}) as client:
             models, seen = [], set()
-            for row in rows:
-                ident = row.get('id')
-                if not isinstance(ident, str) or not MODEL_PATTERN.fullmatch(ident) or key.casefold() in ident.casefold() or ident in seen:
+            cursor, cursors, native, total_rows, total_bytes = None, set(), False, 0, 0
+            for attempt in range(8):
+                remaining = 1_000_000 - total_bytes
+                if remaining <= 0:
+                    raise CatalogError()
+                transport.max_response = remaining
+                headers = ({'x-api-key': key, 'anthropic-version': '2023-06-01'} if native else
+                           {'authorization': 'Bearer ' + key})
+                params = {'limit': '1000'} if native or cursor is not None else None
+                if cursor is not None:
+                    params['after_id'] = cursor
+                response = await client.get(endpoint, headers=headers, params=params)
+                total_bytes += len(response.content)
+                if total_bytes > 1_000_000:
+                    raise CatalogError()
+                if attempt == 0 and response.status_code in (401, 403):
+                    native = True
                     continue
-                family = model_family(ident)
-                if family is None:
-                    continue
-                seen.add(ident)
-                models.append({'id': ident, 'family': family})
-                if len(models) == 512:
-                    break
-            return models
+                if response.status_code != 200:
+                    raise CatalogError()
+                payload = response.json()
+                rows = payload.get('data') if isinstance(payload, dict) else None
+                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                    raise CatalogError()
+                total_rows += len(rows)
+                if total_rows > 2048 or ('has_more' in payload and type(payload['has_more']) is not bool):
+                    raise CatalogError()
+                for row in rows:
+                    ident = row.get('id')
+                    if not isinstance(ident, str) or not MODEL_PATTERN.fullmatch(ident) or key.casefold() in ident.casefold() or ident in seen:
+                        continue
+                    family = model_family(ident)
+                    if family is None:
+                        continue
+                    seen.add(ident)
+                    models.append({'id': ident, 'family': family})
+                    if len(models) > 512:
+                        raise CatalogError()
+                if not payload.get('has_more', False):
+                    return models
+                cursor = payload.get('last_id')
+                if (not rows or not isinstance(cursor, str) or not MODEL_PATTERN.fullmatch(cursor) or
+                        key.casefold() in cursor.casefold() or cursor in cursors or rows[-1].get('id') != cursor):
+                    raise CatalogError()
+                cursors.add(cursor)
+            # Never publish a partial catalog when pagination exceeds the budget.
+            raise CatalogError()

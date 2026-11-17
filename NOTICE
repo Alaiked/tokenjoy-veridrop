@@ -15,6 +15,9 @@ long-context opt-in and failure-stop; packaging, deployment docs and tests.
 Additional TokenJoy modification (2026-11-17): authenticated transient catalog
 lookup with the same secure outbound transport, fixed model-list request,
 bounded filtered Claude/OpenAI/Gemini IDs and no inference probes or storage.
+Catalog compatibility: prefer Bearer-only OpenAI format; one 401/403 native
+authentication fallback and bounded same-origin cursor pagination, with a
+GET-only fixed-path query allowlist and no partial catalog on budget exhaustion.
 Fake-IP DNS compatibility: benchmark-only system answers may use one bounded
 fixed public DoH lookup; connection-time public-IP and TLS validation remain.
 
